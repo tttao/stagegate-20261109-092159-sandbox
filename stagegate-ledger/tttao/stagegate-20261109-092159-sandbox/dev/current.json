@@ -3,13 +3,17 @@
   "breakglass_incident": null,
   "converged": true,
   "env": "dev",
-  "recorded_at": "2026-11-09T08:23:05.996624Z",
+  "recorded_at": "2026-11-09T08:26:25.815701Z",
   "repo": "tttao/stagegate-20261109-092159-sandbox",
   "run_attempt": 1,
-  "run_id": 42585463780,
-  "sha": "6131783b82b147d490da65ac6e5674247e459f3f",
+  "run_id": 42585840492,
+  "sha": "ef6c5ca8b8ad0552d7a8da68b5901147cb06ac8c",
   "units": {
     "base": {
+      "converged": true,
+      "status": "no_changes"
+    },
+    "grants": {
       "converged": true,
       "status": "applied"
     }
