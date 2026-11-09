@@ -1,0 +1,21 @@
+{
+  "approver": "tttao",
+  "breakglass_incident": null,
+  "converged": true,
+  "env": "prod",
+  "recorded_at": "2026-11-09T08:34:53.032876Z",
+  "repo": "tttao/stagegate-20261109-092159-sandbox",
+  "run_attempt": 1,
+  "run_id": 42586680700,
+  "sha": "f0d9a4823efe7917740701be5f7334ca4c7166e7",
+  "units": {
+    "base": {
+      "converged": true,
+      "status": "applied"
+    },
+    "grants": {
+      "converged": true,
+      "status": "no_changes"
+    }
+  }
+}
