@@ -1,0 +1,23 @@
+# Sandbox caller of the in-repo copy of iac-staged (rewritten to ./actions by e2e/seed.sh).
+name: main
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  staged:
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+      issues: write
+      actions: read
+    uses: ./.github/workflows/iac-staged.yml
+    secrets:
+      teams-webhook: ${{ secrets.TEAMS_WEBHOOK }}
+      ledger-token: ${{ secrets.LEDGER_TOKEN }}
+      extra-env-secret: ${{ secrets.STATE_TOKEN }} # sandbox-only: state-sync.sh
+      plan-passphrase: ${{ secrets.PLAN_PASSPHRASE }} # sandbox-only: ephemeral.py

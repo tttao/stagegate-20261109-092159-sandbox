@@ -5,7 +5,7 @@ stages: [dev, prp, prod]
 engine: opentofu
 units_root: stages
 ledger:
-  url: git-branch:///home/runner/work/stagegate-sandbox/stagegate-sandbox?branch=stagegate-ledger&remote=origin
+  url: git-branch:///home/runner/work/stagegate-20261109-092159-sandbox/stagegate-20261109-092159-sandbox?branch=stagegate-ledger&remote=origin
 gate: always
 notify:
   teams: true

@@ -1,0 +1,18 @@
+# Sandbox caller of the in-repo copy of iac-pr (rewritten to ./actions by e2e/seed.sh).
+# It passes no state token: PR plans never hold a write token (R39) and run against empty state.
+name: pr
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  pr:
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+      security-events: write
+      actions: read
+    uses: ./.github/workflows/iac-pr.yml

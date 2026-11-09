@@ -1,0 +1,757 @@
+# One run per push to main: dev -> prp -> prod-plan -> gated prod. See docs/concepts/staged-run.md.
+#
+# Lines marked STAGEGATE_REF are placeholders (all-zero SHA, owner OWNER): scripts/set-stagegate-ref.sh
+# rewrites them at release (or to ./actions for in-repo runs). This file is not callable before that.
+name: iac-staged
+
+on:
+  workflow_call:
+    inputs:
+      tool-mirror:
+        description: >-
+          Optional https base URL (no trailing slash) replacing https://github.com for tool
+          downloads (GitHub Enterprise Server or offline runners). SHA-256 checks still apply.
+        type: string
+        required: false
+        default: ""
+      start-stage:
+        description: First stage to run (dev, prp or prod-plan). Earlier stages are skipped; the guard still applies.
+        type: string
+        required: false
+        default: dev
+      config-path:
+        description: Path of the stagegate configuration file.
+        type: string
+        required: false
+        default: .stagegate.yaml
+    secrets:
+      teams-webhook:
+        description: Optional Teams incoming-webhook URL for notifications.
+        required: false
+      ledger-token:
+        description: Optional fine-grained token (contents write on the repository) for a git-branch:// ledger store.
+        required: false
+      plan-passphrase:
+        description: >-
+          SANDBOX ONLY (e2e/ephemeral.py): exported as STAGEGATE_TEST_PASSPHRASE to the plan
+          and apply steps, replacing the Key Vault key of the plan encryption.
+        required: false
+      extra-env-secret:
+        description: >-
+          Optional secret exported as STAGEGATE_EXTRA_SECRET to the plan and apply steps only (so
+          Terragrunt hooks can read it). Sandbox-only escape hatch for the e2e fixture's state
+          sync; leave it unset in real repositories.
+        required: false
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: resolve
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run-dev: ${{ steps.resolve.outputs.run-dev }}
+      run-prp: ${{ steps.resolve.outputs.run-prp }}
+      run-prod-plan: ${{ steps.resolve.outputs.run-prod-plan }}
+      ledger-url: ${{ steps.resolve.outputs.ledger-url }}
+      units-root: ${{ steps.resolve.outputs.units-root }}
+      features: ${{ steps.features.outputs.features }}
+      engine: ${{ steps.resolve.outputs.engine }}
+      allow-cascade: ${{ steps.resolve.outputs.allow-cascade }}
+      order: ${{ steps.resolve.outputs.order }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - name: Refuse a superseded commit (R70)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # a newer push to main carries this change and promotes it; an older run never does
+          tip="$(stagegate main-tip --repo "$REPO")"
+          [ "$tip" = "$SHA" ] || {
+            echo "::error::superseded: $SHA is not the tip of main ($tip); the run of the newer commit promotes the change"
+            exit 1
+          }
+      - name: Refuse settings that are not supported yet (R35, R73)
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          if ! problems="$(stagegate config check-supported --path "$CONFIG_PATH" 2>&1)"; then
+            while IFS= read -r line; do echo "::error::$line"; done <<<"$problems"
+            exit 1
+          fi
+      - id: resolve
+        name: Validate start-stage and read the configuration
+        env:
+          START_STAGE: ${{ inputs.start-stage }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          case "$START_STAGE" in dev|prp|prod-plan) ;; *)
+            echo "::error::start-stage must be dev, prp or prod-plan"
+            exit 1 ;;
+          esac
+          stagegate config show --path "$CONFIG_PATH" >"$RUNNER_TEMP/stagegate-config.json"
+          cfg="$RUNNER_TEMP/stagegate-config.json"
+          jq -e '.stages == ["dev", "prp", "prod"]' "$cfg" >/dev/null || {
+            echo "::error::iac-staged runs the stages dev, prp, prod; set stages accordingly in the configuration"
+            exit 1
+          }
+          {
+            [ "$START_STAGE" = dev ] && echo run-dev=true || echo run-dev=false
+            [ "$START_STAGE" = prod-plan ] && echo run-prp=false || echo run-prp=true
+            echo run-prod-plan=true
+            echo "ledger-url=$(jq -r '.ledger.url // ""' "$cfg")"
+            echo "units-root=$(jq -r '.units_root' "$cfg")"
+            echo "engine=$(jq -r '.engine' "$cfg")"
+            echo "allow-cascade=$(jq -r '.allow_cascade' "$cfg")"
+            echo "order=$(jq -r '.stages | join(",")' "$cfg")"
+          } >>"$GITHUB_OUTPUT"
+      - id: features
+        name: Detect platform features
+        # R66: informational for now; it must never block the staged run (R67 fix).
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: |
+          set -o pipefail
+          if features="$(stagegate features --json | jq -c .)"; then
+            echo "features=$features" >>"$GITHUB_OUTPUT"
+            echo "platform features: $features"
+          else
+            echo "::warning::stagegate features failed; continuing with features={}"
+            echo "features={}" >>"$GITHUB_OUTPUT"
+          fi
+
+  dev:
+    # plan, apply and record in one job; no approval needed
+    name: dev
+    needs: resolve
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.resolve.result == 'success' && needs.resolve.outputs.run-dev == 'true' }}
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write # OIDC login to Azure and Databricks
+      contents: read # check out the code
+      deployments: write # mirror the ledger as a GitHub deployment
+      issues: write # stop-the-line issues
+      actions: read # approvals and the plan artifact of this run
+    concurrency:
+      group: stagegate-${{ github.repository }}-dev
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      STAGEGATE_LEDGER_URL: ${{ vars.STAGEGATE_LEDGER_URL || needs.resolve.outputs.ledger-url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Require a ledger URL
+        run: |
+          [ -n "$STAGEGATE_LEDGER_URL" ] || {
+            echo "::error::no ledger URL: set STAGEGATE_LEDGER_URL on the environment or ledger.url in .stagegate.yaml"
+            exit 1
+          }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: guard
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/guard@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          stage: dev
+          sha: ${{ github.sha }}
+          order: ${{ needs.resolve.outputs.order }}
+      - id: plan
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/plan@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+        with:
+          env: dev
+          units-root: ${{ needs.resolve.outputs.units-root }}
+          engine: ${{ needs.resolve.outputs.engine }}
+          encrypt: "false"
+          binding-mode: same-job
+      - id: apply
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/apply@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+        with:
+          env: dev
+          units-root: ${{ needs.resolve.outputs.units-root }}
+          engine: ${{ needs.resolve.outputs.engine }}
+          encrypt: "false"
+          binding-mode: same-job
+      - id: units
+        name: Locate the units record
+        if: ${{ !cancelled() }}
+        run: |
+          f="$RUNNER_TEMP/stagegate/dev/units.json"
+          if [ -f "$f" ]; then echo "units-json=$f" >>"$GITHUB_OUTPUT"; fi
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/ledger@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ !cancelled() && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          env: dev
+          sha: ${{ github.sha }}
+          run-id: ${{ github.run_id }}
+          run-attempt: ${{ github.run_attempt }}
+          units-json: ${{ steps.units.outputs.units-json }}
+          mirror-deployments: "true"
+      - name: Open the stop-the-line issue
+        if: ${{ failure() && steps.apply.outcome == 'failure' && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: stagegate issue stop-the-line --repo "$REPO" --env dev --sha "$SHA" --run-url "$RUN_URL"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ failure() && steps.guard.outcome != 'failure' }}
+        with:
+          event: stage_failed
+          repo: ${{ github.repository }}
+          env: dev
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+
+  prp:
+    # pre-production: same shape as dev, after dev
+    name: prp
+    needs: [resolve, dev]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.resolve.result == 'success' && needs.resolve.outputs.run-prp == 'true' && (needs.dev.result == 'success' || (needs.resolve.outputs.run-dev == 'false' && needs.dev.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    environment: prp
+    permissions:
+      id-token: write # OIDC login to Azure and Databricks
+      contents: read # check out the code
+      deployments: write # mirror the ledger as a GitHub deployment
+      issues: write # stop-the-line issues
+      actions: read # approvals and the plan artifact of this run
+    concurrency:
+      group: stagegate-${{ github.repository }}-prp
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      STAGEGATE_LEDGER_URL: ${{ vars.STAGEGATE_LEDGER_URL || needs.resolve.outputs.ledger-url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Require a ledger URL
+        run: |
+          [ -n "$STAGEGATE_LEDGER_URL" ] || {
+            echo "::error::no ledger URL: set STAGEGATE_LEDGER_URL on the environment or ledger.url in .stagegate.yaml"
+            exit 1
+          }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: guard
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/guard@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          stage: prp
+          sha: ${{ github.sha }}
+          order: ${{ needs.resolve.outputs.order }}
+      - id: plan
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/plan@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+        with:
+          env: prp
+          units-root: ${{ needs.resolve.outputs.units-root }}
+          engine: ${{ needs.resolve.outputs.engine }}
+          encrypt: "false"
+          binding-mode: same-job
+      - id: apply
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/apply@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+        with:
+          env: prp
+          units-root: ${{ needs.resolve.outputs.units-root }}
+          engine: ${{ needs.resolve.outputs.engine }}
+          encrypt: "false"
+          binding-mode: same-job
+      - id: units
+        name: Locate the units record
+        if: ${{ !cancelled() }}
+        run: |
+          f="$RUNNER_TEMP/stagegate/prp/units.json"
+          if [ -f "$f" ]; then echo "units-json=$f" >>"$GITHUB_OUTPUT"; fi
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/ledger@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ !cancelled() && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          env: prp
+          sha: ${{ github.sha }}
+          run-id: ${{ github.run_id }}
+          run-attempt: ${{ github.run_attempt }}
+          units-json: ${{ steps.units.outputs.units-json }}
+          mirror-deployments: "true"
+      - name: Open the stop-the-line issue
+        if: ${{ failure() && steps.apply.outcome == 'failure' && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: stagegate issue stop-the-line --repo "$REPO" --env prp --sha "$SHA" --run-url "$RUN_URL"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ failure() && steps.guard.outcome != 'failure' }}
+        with:
+          event: stage_failed
+          repo: ${{ github.repository }}
+          env: prp
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+
+  prod-plan:
+    # plan prod once, scan in-job, upload the encrypted plan + manifest; no reviewers here
+    name: prod-plan
+    outputs:
+      has-changes: ${{ steps.plan.outputs.has-changes }}
+      critical: ${{ steps.summary.outputs.critical }}
+      high: ${{ steps.summary.outputs.high }}
+      units: ${{ steps.summary.outputs.units }}
+    needs: [resolve, dev, prp]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.resolve.result == 'success' && needs.resolve.outputs.run-prod-plan == 'true' && (needs.dev.result == 'success' || (needs.resolve.outputs.run-dev == 'false' && needs.dev.result == 'skipped')) && (needs.prp.result == 'success' || (needs.resolve.outputs.run-prp == 'false' && needs.prp.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    environment: prod-plan
+    permissions:
+      id-token: write # OIDC login to Azure and Databricks
+      contents: read # check out the code
+      issues: read # the guard reads open stop-the-line issues; this job writes none
+    concurrency:
+      group: stagegate-${{ github.repository }}-prod-plan
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      STAGEGATE_LEDGER_URL: ${{ vars.STAGEGATE_LEDGER_URL || needs.resolve.outputs.ledger-url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Require a ledger URL
+        run: |
+          [ -n "$STAGEGATE_LEDGER_URL" ] || {
+            echo "::error::no ledger URL: set STAGEGATE_LEDGER_URL on the environment or ledger.url in .stagegate.yaml"
+            exit 1
+          }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: guard
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/guard@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          stage: prod
+          sha: ${{ github.sha }}
+          order: ${{ needs.resolve.outputs.order }}
+      - id: plan
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/plan@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+        with:
+          env: prod
+          units-root: ${{ needs.resolve.outputs.units-root }}
+          engine: ${{ needs.resolve.outputs.engine }}
+          encrypt: "true"
+          binding-mode: encrypted_plan
+          key-vault-key-id: ${{ vars.STAGEGATE_KEY_VAULT_KEY_ID }}
+          allow-cascade: ${{ needs.resolve.outputs.allow-cascade }} # UNSAFE when true (R52)
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/policy@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          plan-json: ${{ steps.plan.outputs.json-dir }}
+          stage: prod
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ steps.plan.outputs.json-dir }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: json
+          cache: "false"
+          output: ${{ runner.temp }}/trivy-prod-plan.report
+      - name: List Trivy findings (ids and severities only)
+        if: ${{ !cancelled() && steps.trivy.outcome != 'skipped' }}
+        env:
+          REPORT: ${{ runner.temp }}/trivy-prod-plan.report
+        run: |
+          [ -f "$REPORT" ] || exit 0
+          jq -r '.Results[]? | .Target as $t | .Misconfigurations[]? | "\(.Severity) \(.ID) \($t | split("/") | last)"' "$REPORT"
+      - id: summary
+        name: Summarise the plan
+        env:
+          CHANGESET: ${{ steps.plan.outputs.changeset-path }}
+          MANIFEST: ${{ steps.plan.outputs.manifest-path }}
+        run: |
+          critical="$(jq -e '.risk.critical' "$CHANGESET")"
+          high="$(jq -e '.risk.high' "$CHANGESET")"
+          units="$(jq -ec '.units | keys' "$MANIFEST")"
+          {
+            echo "critical=$critical"
+            echo "high=$high"
+            echo "units=$units"
+          } >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stagegate-prod-plan
+          path: |
+            ${{ steps.plan.outputs.plan-dir }}
+            ${{ steps.plan.outputs.manifest-path }}
+          retention-days: 7
+          if-no-files-found: error
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ steps.plan.outputs.has-changes == 'true' }}
+        with:
+          event: prod_waiting
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          changeset: ${{ steps.plan.outputs.changeset-path }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ failure() && steps.guard.outcome != 'failure' }}
+        with:
+          event: stage_failed
+          repo: ${{ github.repository }}
+          env: prod-plan
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+
+  prod:
+    # apply the approved encrypted plan; the prod environment holds the reviewers
+    name: prod
+    needs: [resolve, prod-plan]
+    if: ${{ github.ref == 'refs/heads/main' && needs.prod-plan.outputs.has-changes == 'true' }}
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write # OIDC login to Azure and Databricks
+      contents: read # check out the code
+      deployments: write # mirror the ledger as a GitHub deployment
+      issues: write # stop-the-line issues
+      actions: read # approvals and the plan artifact of this run
+    concurrency:
+      group: stagegate-${{ github.repository }}-prod
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      STAGEGATE_LEDGER_URL: ${{ vars.STAGEGATE_LEDGER_URL || needs.resolve.outputs.ledger-url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Require a ledger URL
+        run: |
+          [ -n "$STAGEGATE_LEDGER_URL" ] || {
+            echo "::error::no ledger URL: set STAGEGATE_LEDGER_URL on the environment or ledger.url in .stagegate.yaml"
+            exit 1
+          }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: guard
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/guard@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          stage: prod
+          sha: ${{ github.sha }}
+          order: ${{ needs.resolve.outputs.order }}
+      - id: approver
+        name: Read the approvers (fails when there are none)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          login="$(stagegate approvals list --repo "$REPO" --run-id "$RUN_ID" --env prod)"
+          echo "login=$login" >>"$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stagegate-prod-plan
+          path: ${{ runner.temp }}/stagegate-prod-plan
+      - id: apply
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/apply@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+        with:
+          env: prod
+          units-root: ${{ needs.resolve.outputs.units-root }}
+          engine: ${{ needs.resolve.outputs.engine }}
+          binding-mode: encrypted_plan
+          plan-artifact: ${{ runner.temp }}/stagegate-prod-plan
+          manifest-path: ${{ runner.temp }}/stagegate-prod-plan/manifest.json
+          encrypt: "true"
+          key-vault-key-id: ${{ vars.STAGEGATE_KEY_VAULT_KEY_ID }}
+      - id: units
+        name: Locate the units record
+        if: ${{ always() }}
+        run: |
+          f="$RUNNER_TEMP/stagegate/prod/units.json"
+          if [ -f "$f" ]; then echo "units-json=$f" >>"$GITHUB_OUTPUT"; fi
+      - name: Explain a plan that was not applied
+        if: ${{ failure() && steps.apply.outcome == 'failure' && steps.units.outputs.units-json == '' }}
+        run: |
+          echo "::error::nothing was applied (stale or mismatched plan, or init/decrypt failed); re-run prod-plan to re-plan and approve again."
+          echo "### Prod not applied: re-run prod-plan and approve again" >>"$GITHUB_STEP_SUMMARY"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/ledger@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ always() && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ github.sha }}
+          run-id: ${{ github.run_id }}
+          run-attempt: ${{ github.run_attempt }}
+          units-json: ${{ steps.units.outputs.units-json }}
+          approver: ${{ steps.approver.outputs.login }}
+          mirror-deployments: "true"
+      - name: Open the stop-the-line issue
+        if: ${{ failure() && steps.apply.outcome == 'failure' && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: stagegate issue stop-the-line --repo "$REPO" --env prod --sha "$SHA" --run-url "$RUN_URL"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ success() }}
+        with:
+          event: prod_deployed
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          approver: ${{ steps.approver.outputs.login }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ failure() && steps.guard.outcome != 'failure' }}
+        with:
+          event: prod_failed
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          detail: ${{ steps.apply.outcome == 'failure' && steps.units.outputs.units-json == '' && 'replan_needed' || '' }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+
+  prod-in-sync:
+    # empty prod plan: no reviewers, record every unit as converged at this SHA
+    name: prod-in-sync
+    needs: [resolve, prod-plan]
+    if: ${{ github.ref == 'refs/heads/main' && needs.prod-plan.outputs.has-changes == 'false' }}
+    runs-on: ubuntu-latest
+    environment: prod-plan
+    permissions:
+      id-token: write # OIDC login to Azure and Databricks
+      contents: read # check out the code
+      deployments: write # mirror the ledger as a GitHub deployment
+      issues: write # stop-the-line issues
+      actions: read # approvals and the plan artifact of this run
+    concurrency:
+      group: stagegate-${{ github.repository }}-prod
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      STAGEGATE_LEDGER_URL: ${{ vars.STAGEGATE_LEDGER_URL || needs.resolve.outputs.ledger-url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Require a ledger URL
+        run: |
+          [ -n "$STAGEGATE_LEDGER_URL" ] || {
+            echo "::error::no ledger URL: set STAGEGATE_LEDGER_URL on the environment or ledger.url in .stagegate.yaml"
+            exit 1
+          }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: guard
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/guard@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          stage: prod
+          sha: ${{ github.sha }}
+          order: ${{ needs.resolve.outputs.order }}
+      - id: units
+        name: Build the in-sync units record
+        env:
+          UNITS: ${{ needs.prod-plan.outputs.units }}
+        run: |
+          jq -e 'type == "array" and length > 0 and all(type == "string")' <<<"$UNITS" >/dev/null || {
+            echo "::error::the prod plan reported no units; refusing to write an empty ledger record"
+            exit 1
+          }
+          out="$RUNNER_TEMP/stagegate-in-sync-units.json"
+          jq -c 'map({(.): {status: "no_changes", converged: true}}) | add' <<<"$UNITS" >"$out"
+          echo "units-json=$out" >>"$GITHUB_OUTPUT"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/ledger@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ github.sha }}
+          run-id: ${{ github.run_id }}
+          run-attempt: ${{ github.run_attempt }}
+          units-json: ${{ steps.units.outputs.units-json }}
+          mirror-deployments: "true"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ failure() && steps.guard.outcome != 'failure' }}
+        with:
+          event: prod_failed
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+
+  prod-result:
+    # R50: a rejected prod gate runs no step of the prod job, so nothing else can tell the team.
+    # An apply failure notifies from the prod job itself; only a rejection is announced here.
+    name: prod-result
+    needs: [resolve, prod-plan, prod]
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.prod-plan.outputs.has-changes == 'true' && needs.prod.result == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the code (in-repo actions)
+      actions: read # approvals of this run
+    env:
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: rejected
+        name: Was the prod gate rejected?
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          rc=0
+          stagegate approvals rejected --repo "$REPO" --run-id "$RUN_ID" --env prod --job prod || rc=$?
+          case "$rc" in
+            0) echo "rejected=true" >>"$GITHUB_OUTPUT" ;;
+            1) echo "rejected=false" >>"$GITHUB_OUTPUT" ;;
+            *) echo "::error::cannot read the approvals of this run"; exit 1 ;;
+          esac
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ steps.rejected.outputs.rejected == 'true' }}
+        with:
+          event: prod_rejected
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}

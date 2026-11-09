@@ -1,0 +1,334 @@
+# Nightly drift check per environment, plus a re-scan of main. See docs/concepts/drift.md.
+#
+# Reusable workflow: the caller adds the `schedule` (cron) trigger and calls it on the default branch.
+# Drift plans run at the SHA the ledger says is live for the environment (not main), take the normal
+# state lock, never apply, and run in the `drift-<env>` environment (main-only, no reviewers) with a
+# plan identity that has no apply rights.
+#
+# Token scopes: the drift jobs run the live SHA's HCL, so they hold no security-events scope. The
+# `rescan` job holds `security-events: write` and runs HCL scanners over main. Main is trusted code
+# (reviewed and merged), no PR code reaches it, so one job is acceptable here (R39 is about PR code).
+#
+# Lines marked STAGEGATE_REF are placeholders (all-zero SHA, owner OWNER): scripts/set-stagegate-ref.sh
+# rewrites them at release. The `--local` (./actions) form is not supported for this workflow: the
+# drift job checks out the live SHA after installing stagegate, and that checkout would replace
+# ./actions. This file is not callable before the release rewrite.
+name: iac-nightly
+
+on:
+  workflow_call:
+    inputs:
+      tool-mirror:
+        description: >-
+          Optional https base URL (no trailing slash) replacing https://github.com for tool
+          downloads (GitHub Enterprise Server or offline runners). SHA-256 checks still apply.
+        type: string
+        required: false
+        default: ""
+      config-path:
+        description: Path of the stagegate configuration file.
+        type: string
+        required: false
+        default: .stagegate.yaml
+      checkov-version:
+        description: Checkov version, run with uvx.
+        type: string
+        required: false
+        default: 3.4.3
+    secrets:
+      teams-webhook:
+        description: Optional Teams incoming-webhook URL for notifications.
+        required: false
+      ledger-token:
+        description: Optional fine-grained token (contents read on the repository) for a git-branch:// ledger store.
+        required: false
+      plan-passphrase:
+        description: >-
+          SANDBOX ONLY (e2e/ephemeral.py): exported as STAGEGATE_TEST_PASSPHRASE to the plan
+          and apply steps, replacing the Key Vault key of the plan encryption.
+        required: false
+      extra-env-secret:
+        description: >-
+          Optional secret exported as STAGEGATE_EXTRA_SECRET to the plan and apply steps only (so
+          Terragrunt hooks can read it). Sandbox-only escape hatch for the e2e fixture's state
+          sync; leave it unset in real repositories.
+        required: false
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: resolve
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      envs: ${{ steps.resolve.outputs.envs }}
+      ledger-url: ${{ steps.resolve.outputs.ledger-url }}
+      units-root: ${{ steps.resolve.outputs.units-root }}
+      engine: ${{ steps.resolve.outputs.engine }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - name: Refuse settings that are not supported yet (R35, R73)
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          if ! problems="$(stagegate config check-supported --path "$CONFIG_PATH" 2>&1)"; then
+            while IFS= read -r line; do echo "::error::$line"; done <<<"$problems"
+            exit 1
+          fi
+      - id: resolve
+        name: Read the configuration
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          stagegate config show --path "$CONFIG_PATH" >"$RUNNER_TEMP/stagegate-config.json"
+          cfg="$RUNNER_TEMP/stagegate-config.json"
+          {
+            # every configured stage; prod-plan is a step of the staged run, not an environment
+            echo "envs=$(jq -c '[.stages[] | select(. != "prod-plan")]' "$cfg")"
+            echo "ledger-url=$(jq -r '.ledger.url // ""' "$cfg")"
+            echo "units-root=$(jq -r '.units_root' "$cfg")"
+            echo "engine=$(jq -r '.engine' "$cfg")"
+          } >>"$GITHUB_OUTPUT"
+
+  drift:
+    # plan the live SHA of one environment, open/update/close its drift issue
+    name: drift-${{ matrix.env }}
+    needs: resolve
+    if: ${{ github.ref == 'refs/heads/main' && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: drift-${{ matrix.env }}
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.resolve.outputs.envs) }}
+    permissions:
+      id-token: write # OIDC login to Azure and Databricks
+      contents: read # check out the live SHA
+      issues: write # the drift issue
+      actions: read # run metadata
+    concurrency:
+      group: stagegate-drift-${{ github.repository }}-${{ matrix.env }}
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      STAGEGATE_LEDGER_URL: ${{ vars.STAGEGATE_LEDGER_URL || needs.resolve.outputs.ledger-url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      DRIFT_ENV: ${{ matrix.env }}
+    steps:
+      - name: Require a ledger URL
+        run: |
+          [ -n "$STAGEGATE_LEDGER_URL" ] || {
+            echo "::error::no ledger URL: set STAGEGATE_LEDGER_URL on the environment or ledger.url in .stagegate.yaml"
+            exit 1
+          }
+      - name: Check out the run's commit (a git-branch:// ledger is read from this clone)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: ledger
+        name: Read what is live in this environment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+          REPO: ${{ github.repository }}
+        run: |
+          stagegate ledger show --store "$STAGEGATE_LEDGER_URL" --repo "$REPO" --env "$DRIFT_ENV" \
+            >"$RUNNER_TEMP/ledger.json"
+          sha="$(jq -r '.sha // ""' "$RUNNER_TEMP/ledger.json")"
+          if [ -z "$sha" ]; then
+            echo "::notice::no ledger record for $DRIFT_ENV; nothing is live yet, skipping drift"
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+          elif [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+            echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          else
+            echo "::error::the ledger record of $DRIFT_ENV has no valid commit SHA"
+            exit 1
+          fi
+      - id: failed
+        name: Skip while an apply failure is open
+        if: ${{ steps.ledger.outputs.skip == 'false' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          open="$(stagegate issue open-count --repo "$REPO" --label stagegate:apply-failed --label "env:$DRIFT_ENV")"
+          if [ "$open" -gt 0 ]; then
+            echo "::notice::an apply failure is open for $DRIFT_ENV; the state may be half-applied, skipping drift"
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: ${{ steps.failed.outputs.skip == 'false' }}
+        with:
+          ref: ${{ steps.ledger.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        if: ${{ steps.failed.outputs.skip == 'false' }}
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/plan@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+          SG_SHA: ${{ steps.ledger.outputs.sha }} # the plan describes the live SHA, not main
+        with:
+          env: ${{ matrix.env }}
+          units-root: ${{ needs.resolve.outputs.units-root }}
+          engine: ${{ needs.resolve.outputs.engine }}
+          encrypt: "false"
+          binding-mode: drift
+          drift: "true"
+          expect-sha: "true" # fail unless the checkout really is the live SHA
+      - name: Evaluate drift
+        if: ${{ steps.failed.outputs.skip == 'false' }}
+        env:
+          JSON_DIR: ${{ steps.plan.outputs.json-dir }}
+          EXIT_CODES: ${{ steps.plan.outputs.exit-codes-path }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          stagegate drift evaluate --plan-json "$JSON_DIR" --exit-codes "$EXIT_CODES" \
+            --env "$DRIFT_ENV" --config "$CONFIG_PATH" --out "$RUNNER_TEMP/drift-result.json"
+      - id: sync
+        name: Open, update or close the drift issue
+        if: ${{ steps.failed.outputs.skip == 'false' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.ledger.outputs.sha }}
+        run: |
+          stagegate drift sync --repo "$REPO" --env "$DRIFT_ENV" --result "$RUNNER_TEMP/drift-result.json" \
+            --sha "$SHA" --run-url "$RUN_URL"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ steps.sync.outputs.change == 'opened' }}
+        with:
+          event: drift_found
+          repo: ${{ github.repository }}
+          env: ${{ matrix.env }}
+          sha: ${{ steps.ledger.outputs.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ steps.sync.outputs.change == 'cleared' }}
+        with:
+          event: drift_cleared
+          repo: ${{ github.repository }}
+          env: ${{ matrix.env }}
+          sha: ${{ steps.ledger.outputs.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ failure() }}
+        with:
+          event: stage_failed
+          repo: ${{ github.repository }}
+          env: drift-${{ matrix.env }}
+          sha: ${{ steps.ledger.outputs.sha || github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+
+  rescan:
+    # Trivy and Checkov over main, SARIF uploaded, then a count of new high/critical alerts
+    name: rescan
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out main; upload-sarif on private repositories
+      security-events: write # upload SARIF and read the alerts (main is trusted code, see the header)
+      actions: read # upload-sarif on private repositories
+    env:
+      UV_NO_CACHE: "1" # R40: no uv cache anywhere
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - name: Prepare the SARIF directory
+        run: mkdir -p "$RUNNER_TEMP/sarif"
+      - id: trivy
+        name: Trivy config scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          limit-severities-for-sarif: "true"
+          exit-code: "0" # findings are reported as alerts, they do not fail the nightly run
+          format: sarif
+          cache: "false"
+          output: ${{ runner.temp }}/sarif/trivy.raw.sarif
+      - name: Scrub the Trivy SARIF
+        env:
+          SARIF_IN: ${{ runner.temp }}/sarif/trivy.raw.sarif
+          SARIF_OUT: ${{ runner.temp }}/sarif/trivy.sarif
+        run: stagegate sarif-scrub --in "$SARIF_IN" --out "$SARIF_OUT"
+      - id: checkov
+        name: Checkov
+        env:
+          CHECKOV_VERSION: ${{ inputs.checkov-version }}
+        run: |
+          args=()
+          if [ -f .stagegate/checkov.baseline ]; then
+            args+=(--baseline .stagegate/checkov.baseline)
+          fi
+          uvx "checkov@$CHECKOV_VERSION" --directory . --framework terraform github_actions \
+            --output sarif --output-file-path "$RUNNER_TEMP/sarif/checkov" --quiet --soft-fail "${args[@]}"
+      - name: Scrub the Checkov SARIF
+        env:
+          SARIF_IN: ${{ runner.temp }}/sarif/checkov/results_sarif.sarif
+          SARIF_OUT: ${{ runner.temp }}/sarif/checkov.sarif
+        run: stagegate sarif-scrub --in "$SARIF_IN" --out "$SARIF_OUT"
+      - name: Upload the Trivy SARIF
+        uses: github/codeql-action/upload-sarif@f3bbb05694c2f74569081c28664c0866d64dec21 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/trivy.sarif
+          category: stagegate-trivy
+      - name: Upload the Checkov SARIF
+        uses: github/codeql-action/upload-sarif@f3bbb05694c2f74569081c28664c0866d64dec21 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/checkov.sarif
+          category: stagegate-checkov
+      - id: findings
+        name: Count new high and critical alerts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # assigned first so a CLI error fails the step (not swallowed by echo "$(...)")
+          count="$(stagegate findings new --repo "$REPO" --since-hours 26)"
+          [[ "$count" =~ ^[0-9]+$ ]] || {
+            echo "::error::stagegate findings new printed no count"
+            exit 1
+          }
+          echo "count=$count" >>"$GITHUB_OUTPUT"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ steps.findings.outputs.count != '0' }}
+        with:
+          event: new_findings
+          repo: ${{ github.repository }}
+          env: main
+          sha: ${{ github.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}

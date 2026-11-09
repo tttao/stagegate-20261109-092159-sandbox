@@ -1,0 +1,318 @@
+# Pull-request checks: static checks and scans, plus a dev-only plan with a risk comment. It never applies.
+# See docs/concepts/pr-checks.md.
+#
+# Token scopes (R39): a job that evaluates the PR's HCL (validate, plan) never holds
+# `pull-requests: write` or `security-events: write`. Those jobs hand their result over as an
+# artifact, and the small `comment` and `upload-sarif` jobs, which run no PR code, publish it.
+#
+# Trigger: this is a reusable workflow. The calling workflow must use `pull_request`, never
+# `pull_request_target` (which would run with secrets and a write token against untrusted code).
+# Pull requests from forks get no OIDC token: plan-dev is skipped for them, and so is the SARIF
+# upload (a fork's token cannot write security events). The checks still run.
+#
+# Lines marked STAGEGATE_REF are placeholders (all-zero SHA, owner OWNER): scripts/set-stagegate-ref.sh
+# rewrites them at release (or to ./actions for in-repo runs). This file is not callable before that.
+name: iac-pr
+
+on:
+  workflow_call:
+    inputs:
+      tool-mirror:
+        description: >-
+          Optional https base URL (no trailing slash) replacing https://github.com for tool
+          downloads (GitHub Enterprise Server or offline runners). SHA-256 checks still apply.
+        type: string
+        required: false
+        default: ""
+      config-path:
+        description: Path of the stagegate configuration file.
+        type: string
+        required: false
+        default: .stagegate.yaml
+      checkov-version:
+        description: Checkov version, run with uvx.
+        type: string
+        required: false
+        default: 3.4.3
+
+permissions: {}
+
+jobs:
+  checks:
+    # static checks and scans; no cloud access, no plan
+    name: checks
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the code
+    env:
+      UV_NO_CACHE: "1" # R40: no uv cache anywhere
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: config
+        name: Read the configuration
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          stagegate config show --path "$CONFIG_PATH" >"$RUNNER_TEMP/stagegate-config.json"
+          echo "units-root=$(jq -r '.units_root' "$RUNNER_TEMP/stagegate-config.json")" >>"$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/sarif"
+      - name: Format check (OpenTofu)
+        run: tofu fmt -check -recursive
+      - name: Format check (Terragrunt)
+        run: terragrunt hcl format --check
+      - name: Validate the Terragrunt configuration
+        env:
+          UNITS_ROOT: ${{ steps.config.outputs.units-root }}
+        run: terragrunt hcl validate --working-dir "$UNITS_ROOT"
+      - id: trivy
+        name: Trivy config scan
+        if: ${{ !cancelled() }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          limit-severities-for-sarif: "true"
+          exit-code: "1"
+          format: sarif
+          cache: "false"
+          output: ${{ runner.temp }}/sarif/trivy.raw.sarif
+      - name: Scrub the Trivy SARIF
+        if: ${{ !cancelled() && steps.trivy.outcome != 'skipped' }}
+        env:
+          SARIF_IN: ${{ runner.temp }}/sarif/trivy.raw.sarif
+          SARIF_OUT: ${{ runner.temp }}/sarif/trivy.sarif
+        run: stagegate sarif-scrub --in "$SARIF_IN" --out "$SARIF_OUT"
+      - id: checkov
+        name: Checkov
+        if: ${{ !cancelled() }}
+        env:
+          CHECKOV_VERSION: ${{ inputs.checkov-version }}
+        run: |
+          args=()
+          if [ -f .stagegate/checkov.baseline ]; then
+            args+=(--baseline .stagegate/checkov.baseline)
+          fi
+          uvx "checkov@$CHECKOV_VERSION" --directory . --framework terraform github_actions \
+            --output sarif --output-file-path "$RUNNER_TEMP/sarif/checkov" --quiet "${args[@]}"
+      - name: Scrub the Checkov SARIF
+        if: ${{ !cancelled() && steps.checkov.outcome != 'skipped' }}
+        env:
+          SARIF_IN: ${{ runner.temp }}/sarif/checkov/results_sarif.sarif
+          SARIF_OUT: ${{ runner.temp }}/sarif/checkov.sarif
+        run: stagegate sarif-scrub --in "$SARIF_IN" --out "$SARIF_OUT"
+      - name: Keep the scrubbed SARIF for the upload job
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stagegate-sarif
+          path: |
+            ${{ runner.temp }}/sarif/trivy.sarif
+            ${{ runner.temp }}/sarif/checkov.sarif
+          retention-days: 1
+          if-no-files-found: warn
+      - name: List findings (rule ids and files only)
+        if: ${{ !cancelled() }}
+        run: |
+          for f in "$RUNNER_TEMP/sarif/trivy.sarif" "$RUNNER_TEMP/sarif/checkov.sarif"; do
+            [ -f "$f" ] || continue
+            jq -r '.runs[]?.results[]? | "\(.ruleId) \(.locations[0].physicalLocation.artifactLocation.uri // "")"' "$f"
+          done
+
+  upload-sarif:
+    # publishes the scrubbed SARIF; checks out and runs no PR code. Fork PRs have a read-only token.
+    name: upload-sarif
+    needs: checks
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.checks.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload SARIF
+      actions: read # upload-sarif on private repositories
+      contents: read # upload-sarif on private repositories (no checkout happens)
+    steps:
+      - id: download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true # the checks job reports its own failure
+        with:
+          name: stagegate-sarif
+          path: ${{ runner.temp }}/sarif
+      - name: Explain a missing artifact
+        if: ${{ steps.download.outcome != 'success' }}
+        run: echo "::warning::no SARIF from checks; see that job"
+      - id: found
+        name: See which SARIF files arrived
+        if: ${{ steps.download.outcome == 'success' }}
+        run: |
+          for tool in trivy checkov; do
+            if [ -f "$RUNNER_TEMP/sarif/$tool.sarif" ]; then echo "$tool=true"; else echo "$tool=false"; fi
+          done >>"$GITHUB_OUTPUT"
+      - name: Upload the Trivy SARIF
+        if: ${{ steps.found.outputs.trivy == 'true' }}
+        uses: github/codeql-action/upload-sarif@f3bbb05694c2f74569081c28664c0866d64dec21 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/trivy.sarif
+          category: stagegate-trivy
+      - name: Upload the Checkov SARIF
+        if: ${{ !cancelled() && steps.found.outputs.checkov == 'true' }}
+        uses: github/codeql-action/upload-sarif@f3bbb05694c2f74569081c28664c0866d64dec21 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/checkov.sarif
+          category: stagegate-checkov
+
+  plan-dev:
+    # plan the changed dev units with a read-only identity, run the pack, comment the risk summary
+    name: plan-dev
+    # Fork pull requests get no OIDC token; the event check keeps a pull_request_target caller out.
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    environment: dev-plan
+    permissions:
+      contents: read # check out the code
+      id-token: write # OIDC login to Azure and Databricks (read-only identity)
+    concurrency:
+      group: stagegate-${{ github.repository }}-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0 # the diff against the base needs the merge base
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - name: Refuse settings that are not supported yet (R35, R73)
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          if ! problems="$(stagegate config check-supported --path "$CONFIG_PATH" 2>&1)"; then
+            while IFS= read -r line; do echo "::error::$line"; done <<<"$problems"
+            exit 1
+          fi
+      - id: changed
+        name: Find the changed dev units
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          stagegate config show --path "$CONFIG_PATH" >"$RUNNER_TEMP/stagegate-config.json"
+          units_root="$(jq -r '.units_root' "$RUNNER_TEMP/stagegate-config.json")"
+          units="$(stagegate changed-units --base "$BASE_SHA" --head "$HEAD_SHA" --units-root "$units_root" --env dev)"
+          {
+            echo "units-root=$units_root"
+            echo "engine=$(jq -r '.engine' "$RUNNER_TEMP/stagegate-config.json")"
+            if [ -z "$units" ]; then
+              echo "any=false"
+            else
+              echo "any=true"
+              # ALL (a change outside the dev units) plans every dev unit
+              if [ "$units" = ALL ]; then echo "only-units="; else echo "only-units=$units"; fi
+            fi
+          } >>"$GITHUB_OUTPUT"
+      - id: plan
+        if: ${{ steps.changed.outputs.any == 'true' }}
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/plan@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          env: dev
+          units-root: ${{ steps.changed.outputs.units-root }}
+          engine: ${{ steps.changed.outputs.engine }}
+          only-units: ${{ steps.changed.outputs.only-units }}
+          encrypt: "false"
+          binding-mode: same-job
+          lock: "false" # a read-only identity cannot write the state lock
+      - id: policy
+        if: ${{ steps.plan.outcome == 'success' }}
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/policy@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          plan-json: ${{ steps.plan.outputs.json-dir }}
+          stage: dev
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: body
+        name: Write the comment body
+        if: ${{ !cancelled() }}
+        env:
+          CHANGED_OUTCOME: ${{ steps.changed.outcome }}
+          ANY: ${{ steps.changed.outputs.any }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          POLICY_OUTCOME: ${{ steps.policy.outcome }}
+          SUMMARY: ${{ steps.plan.outputs.summary-path }}
+        run: |
+          out="$RUNNER_TEMP/pr-comment.md"
+          if [ "$CHANGED_OUTCOME" != success ]; then
+            printf 'The dev plan failed before it started. See the [run](%s).\n' "$RUN_URL" >"$out"
+          elif [ "$ANY" != true ]; then
+            echo "No IaC changes in this pull request; nothing was planned." >"$out"
+          elif [ "$PLAN_OUTCOME" != success ]; then
+            printf 'The dev plan failed. See the [run](%s).\n' "$RUN_URL" >"$out"
+          else
+            {
+              echo "### Dev plan"
+              echo
+              cat "$SUMMARY"
+              echo
+              if [ "$POLICY_OUTCOME" = success ]; then
+                echo "Policy pack: passed."
+              else
+                printf 'Policy pack: failed. See the [run](%s).\n' "$RUN_URL"
+              fi
+            } >"$out"
+          fi
+          echo "path=$out" >>"$GITHUB_OUTPUT"
+      - name: Keep the comment body for the comment job
+        if: ${{ !cancelled() && steps.body.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stagegate-pr-comment
+          path: ${{ steps.body.outputs.path }}
+          retention-days: 1
+          if-no-files-found: error
+
+  comment:
+    # posts the sticky comment; no OIDC and no PR code: only the BASE commit is checked out (R39),
+    # which also gives the in-repo (--local, ./actions) form its actions
+    name: comment
+    needs: plan-dev
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.plan-dev.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the base commit
+      pull-requests: write # the sticky comment
+    steps:
+      - name: Check out the base commit (never the PR head)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true # plan-dev reports its own failure
+        with:
+          name: stagegate-pr-comment
+          path: ${{ runner.temp }}/pr-comment
+      - name: Explain a missing artifact
+        if: ${{ steps.download.outcome != 'success' }}
+        run: echo "::warning::no comment body from plan-dev; see that job"
+      - name: Post the sticky comment
+        if: ${{ steps.download.outcome == 'success' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: stagegate pr-comment --repo "$REPO" --pr "$PR_NUMBER" --body-file "$RUNNER_TEMP/pr-comment/pr-comment.md"

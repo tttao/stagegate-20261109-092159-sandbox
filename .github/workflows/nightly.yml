@@ -1,0 +1,26 @@
+# Sandbox caller of iac-nightly. The `--local` form is not supported for this workflow, so it
+# calls the canonical repository at a released SHA; e2e/seed.sh fills in OWNER and the SHA.
+# workflow_dispatch lets the e2e scenarios start the drift check on demand.
+name: nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions: {}
+
+jobs:
+  nightly:
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      security-events: write
+      actions: read
+    uses: ./.github/workflows/iac-nightly.yml
+    secrets:
+      teams-webhook: ${{ secrets.TEAMS_WEBHOOK }}
+      ledger-token: ${{ secrets.LEDGER_TOKEN }}
+      extra-env-secret: ${{ secrets.STATE_TOKEN }} # sandbox-only: state-sync.sh
+      plan-passphrase: ${{ secrets.PLAN_PASSPHRASE }} # sandbox-only: ephemeral.py

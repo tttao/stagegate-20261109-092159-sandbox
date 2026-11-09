@@ -1,0 +1,37 @@
+# Sandbox caller of iac-breakglass (canonical repository at a released SHA, like nightly.yml).
+name: breakglass
+
+on:
+  workflow_dispatch:
+    inputs:
+      incident:
+        description: Incident reference, like ABC-123 or INC123.
+        required: true
+      sha:
+        description: Full commit SHA to deploy; it must be an ancestor of origin/main.
+        required: true
+      allow-rollback:
+        description: "true allows a rollback."
+        required: false
+        default: "false"
+
+permissions: {}
+
+jobs:
+  breakglass:
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+      issues: write
+      actions: read
+    uses: ./.github/workflows/iac-breakglass.yml
+    with:
+      incident: ${{ inputs.incident }}
+      sha: ${{ inputs.sha }}
+      allow-rollback: ${{ inputs.allow-rollback }}
+    secrets:
+      teams-webhook: ${{ secrets.TEAMS_WEBHOOK }}
+      ledger-token: ${{ secrets.LEDGER_TOKEN }}
+      extra-env-secret: ${{ secrets.STATE_TOKEN }} # sandbox-only: state-sync.sh
+      plan-passphrase: ${{ secrets.PLAN_PASSPHRASE }} # sandbox-only: ephemeral.py

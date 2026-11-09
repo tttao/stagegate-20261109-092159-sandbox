@@ -1,0 +1,371 @@
+# Break-glass: the one documented emergency path into prod. See docs/compliance/dora-art17.md.
+#
+# It needs an incident reference, runs in the `prod-breakglass` environment (its own reviewers, main-only
+# branches, its own identity with prod apply rights), plans and applies in one job and always opens an
+# issue asking for approval after the fact (DORA RTS 2024/1774 Art. 17(1)(g)).
+#
+# By design this path has no guard step: stop-the-line is intentionally not enforced here, because an
+# emergency fix must be able to ship while an earlier stage is red. A failed apply does open the
+# stop-the-line issue for prod (it carries the apply-failed label, so nightly drift skips prod).
+# The prod-breakglass reviewers approve before the plan exists, so the policy pack runs here (stage prod,
+# deny rules fail the run) as the machine check standing in for the review of the plan; Trivy is not run.
+# The post-approval issue is the record.
+#
+# Break-glass always plans and applies the whole prod tree (R71): unchanged units are no-ops, so the
+# ledger record of prod stays truthful for every unit.
+#
+# The sha input must be an ancestor of origin/main (a reviewed, merged commit); anything else is refused
+# before the plan. A sha older than the commit live in prod (a rollback) is refused unless allow-rollback
+# is true. The configuration is read from that sha. Plan encryption and the state lock timeout are the same
+# as for the normal prod stage. STAGEGATE_LEDGER_URL must be set on the prod-breakglass environment.
+#
+# Lines marked STAGEGATE_REF are placeholders (all-zero SHA, owner OWNER): scripts/set-stagegate-ref.sh
+# rewrites them at release. The `--local` (./actions) form is not supported for this workflow: the job
+# checks out the sha to deploy, and that checkout would replace ./actions. This file is not callable
+# before the release rewrite.
+name: iac-breakglass
+
+on:
+  workflow_call:
+    inputs:
+      tool-mirror:
+        description: >-
+          Optional https base URL (no trailing slash) replacing https://github.com for tool
+          downloads (GitHub Enterprise Server or offline runners). SHA-256 checks still apply.
+        type: string
+        required: false
+        default: ""
+      incident:
+        description: Incident reference, like ABC-123 or INC123.
+        type: string
+        required: true
+      sha:
+        description: Full 40-character commit SHA to deploy; it must be an ancestor of origin/main.
+        type: string
+        required: true
+      allow-rollback:
+        description: "true allows a sha older than the commit live in prod (a rollback). Anything but true or false is refused."
+        type: string
+        required: false
+        default: "false"
+      config-path:
+        description: Path of the stagegate configuration file.
+        type: string
+        required: false
+        default: .stagegate.yaml
+    secrets:
+      teams-webhook:
+        description: Optional Teams incoming-webhook URL for notifications.
+        required: false
+      ledger-token:
+        description: Optional fine-grained token (contents write on the repository) for a git-branch:// ledger store.
+        required: false
+      plan-passphrase:
+        description: >-
+          SANDBOX ONLY (e2e/ephemeral.py): exported as STAGEGATE_TEST_PASSPHRASE to the plan
+          and apply steps, replacing the Key Vault key of the plan encryption.
+        required: false
+      extra-env-secret:
+        description: >-
+          Optional secret exported as STAGEGATE_EXTRA_SECRET to the plan and apply steps only (so
+          Terragrunt hooks can read it). Sandbox-only escape hatch for the e2e fixture's state
+          sync; leave it unset in real repositories.
+        required: false
+  workflow_dispatch:
+    inputs:
+      incident:
+        description: Incident reference, like ABC-123 or INC123.
+        type: string
+        required: true
+      sha:
+        description: Full 40-character commit SHA to deploy; it must be an ancestor of origin/main.
+        type: string
+        required: true
+      allow-rollback:
+        description: "true allows a sha older than the commit live in prod (a rollback). Anything but true or false is refused."
+        type: string
+        required: false
+        default: "false"
+      config-path:
+        description: Path of the stagegate configuration file.
+        type: string
+        required: false
+        default: .stagegate.yaml
+
+permissions: {}
+
+jobs:
+  validate:
+    # nothing else runs unless the inputs are well formed
+    name: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      incident: ${{ steps.validate.outputs.incident }}
+      sha: ${{ steps.validate.outputs.sha }}
+      allow-rollback: ${{ steps.validate.outputs.allow-rollback }}
+    steps:
+      - name: Require the main branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          [ "$REF" = refs/heads/main ] || {
+            echo "::error::break-glass runs only from refs/heads/main, not $REF"
+            exit 1
+          }
+      - id: validate
+        name: Validate the incident, the sha and allow-rollback
+        env:
+          INCIDENT: ${{ inputs.incident }}
+          SHA: ${{ inputs.sha }}
+          ALLOW_ROLLBACK: ${{ inputs.allow-rollback }}
+        run: |
+          export LC_ALL=C
+          [[ "$INCIDENT" =~ ^[A-Z]+-[0-9]+$ ]] || [[ "$INCIDENT" =~ ^INC[0-9]+$ ]] || {
+            echo "::error::incident must look like ABC-123 or INC123"
+            exit 1
+          }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::sha must be a full 40-character lowercase commit SHA"
+            exit 1
+          }
+          case "$ALLOW_ROLLBACK" in true | false) ;; *)
+            echo "::error::allow-rollback must be true or false"
+            exit 1 ;;
+          esac
+          {
+            echo "allow-rollback=$ALLOW_ROLLBACK"
+            echo "incident=$INCIDENT"
+            echo "sha=$SHA"
+          } >>"$GITHUB_OUTPUT"
+
+  breakglass:
+    # plan and apply in one job behind the prod-breakglass reviewers
+    name: breakglass
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: prod-breakglass
+    permissions:
+      id-token: write # OIDC login to Azure and Databricks
+      contents: read # check out the code
+      deployments: write # mirror the ledger as a GitHub deployment
+      issues: write # the post-approval issue
+      actions: read # approvals of this run
+    concurrency:
+      group: stagegate-${{ github.repository }}-prod
+      cancel-in-progress: false
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      STAGEGATE_LEDGER_URL: ${{ vars.STAGEGATE_LEDGER_URL }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Require a ledger URL
+        run: |
+          [ -n "$STAGEGATE_LEDGER_URL" ] || {
+            echo "::error::no ledger URL: set STAGEGATE_LEDGER_URL as a variable on the prod-breakglass environment"
+            exit 1
+          }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Refuse a commit that is not on main
+        env:
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}" >/dev/null || {
+            echo "::error::origin/main was not fetched; cannot check that $SHA is on main"
+            exit 1
+          }
+          rc=0
+          git merge-base --is-ancestor "$SHA" origin/main || rc=$?
+          case "$rc" in
+            0) ;;
+            1) echo "::error::$SHA is not an ancestor of origin/main; break-glass only deploys reviewed, merged commits"
+               exit 1 ;;
+            *) echo "::error::cannot check whether $SHA is on main (git exit $rc)"
+               exit 1 ;;
+          esac
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/setup@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - name: Refuse settings that are not supported yet (R35, R73)
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          if ! problems="$(stagegate config check-supported --path "$CONFIG_PATH" 2>&1)"; then
+            while IFS= read -r line; do echo "::error::$line"; done <<<"$problems"
+            exit 1
+          fi
+      - id: cfg
+        name: Read the configuration
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          stagegate config show --path "$CONFIG_PATH" >"$RUNNER_TEMP/stagegate-config.json"
+          cfg="$RUNNER_TEMP/stagegate-config.json"
+          {
+            echo "units-root=$(jq -r '.units_root' "$cfg")"
+            echo "engine=$(jq -r '.engine' "$cfg")"
+          } >>"$GITHUB_OUTPUT"
+      - id: live
+        name: Refuse a rollback unless allow-rollback is true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          ALLOW_ROLLBACK: ${{ needs.validate.outputs.allow-rollback }}
+        run: |
+          stagegate ledger show --store "$STAGEGATE_LEDGER_URL" --repo "$REPO" --env prod \
+            >"$RUNNER_TEMP/ledger-prod.json"
+          live="$(jq -r '.sha // ""' "$RUNNER_TEMP/ledger-prod.json")"
+          if [ -z "$live" ]; then
+            echo "::notice::no ledger record for prod; first deploy, no rollback check"
+            echo "rollback-from=" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$live" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::the ledger record of prod has no valid commit SHA"
+            exit 1
+          }
+          git cat-file -e "$live^{commit}" 2>/dev/null || {
+            echo "::error::the commit live in prod ($live) is not in this repository's history"
+            exit 1
+          }
+          rc=0
+          git merge-base --is-ancestor "$live" "$SHA" || rc=$?
+          case "$rc" in
+            0) echo "rollback-from=" >>"$GITHUB_OUTPUT" ;;
+            1)
+              [ "$ALLOW_ROLLBACK" = true ] || {
+                echo "::error::$SHA is older than the commit live in prod (${live:0:12}); set allow-rollback to true to roll back"
+                exit 1
+              }
+              echo "::warning::rollback from ${live:0:12} to ${SHA:0:12}: the target is older than the commit live in prod"
+              echo "rollback-from=$live" >>"$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::cannot compare $SHA with the live commit (git exit $rc)"
+              exit 1 ;;
+          esac
+      - id: approver
+        name: Read the approvers (fails when there are none)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          login="$(stagegate approvals list --repo "$REPO" --run-id "$RUN_ID" --env prod-breakglass)"
+          echo "login=$login" >>"$GITHUB_OUTPUT"
+      - id: plan
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/plan@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          env: prod
+          units-root: ${{ steps.cfg.outputs.units-root }}
+          engine: ${{ steps.cfg.outputs.engine }}
+          encrypt: "true"
+          binding-mode: breakglass
+          breakglass-incident: ${{ needs.validate.outputs.incident }}
+          lock-timeout: 10m
+          expect-sha: "true" # fail unless the checkout really is the sha to deploy
+          key-vault-key-id: ${{ vars.STAGEGATE_KEY_VAULT_KEY_ID }}
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+          SG_SHA: ${{ needs.validate.outputs.sha }}
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/policy@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        with:
+          plan-json: ${{ steps.plan.outputs.json-dir }}
+          stage: prod
+          tool-mirror: ${{ inputs.tool-mirror }}
+      - id: apply
+        uses: tttao/stagegate-20261109-092159-sandbox/actions/apply@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        env:
+          STAGEGATE_EXTRA_SECRET: ${{ secrets.extra-env-secret }}
+          STAGEGATE_TEST_PASSPHRASE: ${{ secrets.plan-passphrase }}
+          SG_SHA: ${{ needs.validate.outputs.sha }} # the sha that was checked out, not the dispatching ref's
+        with:
+          env: prod
+          units-root: ${{ steps.cfg.outputs.units-root }}
+          engine: ${{ steps.cfg.outputs.engine }}
+          binding-mode: breakglass
+          breakglass-incident: ${{ needs.validate.outputs.incident }}
+          lock-timeout: 10m
+          encrypt: "true"
+          key-vault-key-id: ${{ vars.STAGEGATE_KEY_VAULT_KEY_ID }}
+      - id: units
+        name: Locate the units record
+        if: ${{ always() }}
+        run: |
+          f="$RUNNER_TEMP/stagegate/prod/units.json"
+          if [ -f "$f" ]; then echo "units-json=$f" >>"$GITHUB_OUTPUT"; fi
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/ledger@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ always() && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGEGATE_LEDGER_TOKEN: ${{ secrets.ledger-token }}
+          GIT_CONFIG_COUNT: ${{ secrets.ledger-token && '1' || '0' }}
+          GIT_CONFIG_KEY_0: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$STAGEGATE_LEDGER_TOKEN"; }; f'
+        with:
+          store: ${{ env.STAGEGATE_LEDGER_URL }}
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ needs.validate.outputs.sha }}
+          run-id: ${{ github.run_id }}
+          run-attempt: ${{ github.run_attempt }}
+          units-json: ${{ steps.units.outputs.units-json }}
+          approver: ${{ steps.approver.outputs.login }}
+          breakglass-incident: ${{ needs.validate.outputs.incident }}
+          mirror-deployments: "true"
+      - name: Open the stop-the-line issue
+        if: ${{ failure() && steps.apply.outcome == 'failure' && steps.units.outputs.units-json != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: stagegate issue stop-the-line --repo "$REPO" --env prod --sha "$SHA" --run-url "$RUN_URL"
+      - name: Open the post-approval issue
+        # one issue per use, even when the apply failed (a half-applied prod needs the review most)
+        if: ${{ always() && steps.apply.outcome != 'skipped' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INCIDENT: ${{ needs.validate.outputs.incident }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          APPROVERS: ${{ steps.approver.outputs.login }}
+          CHANGESET: ${{ steps.plan.outputs.changeset-path }}
+          ROLLBACK_FROM: ${{ steps.live.outputs.rollback-from }}
+        run: |
+          args=(--repo "$REPO" --incident "$INCIDENT" --sha "$SHA" --run-url "$RUN_URL" --approvers "$APPROVERS")
+          [ -z "$CHANGESET" ] || args+=(--changeset "$CHANGESET")
+          [ -z "$ROLLBACK_FROM" ] || args+=(--rollback-from "$ROLLBACK_FROM")
+          stagegate issue post-approval "${args[@]}"
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ always() && steps.apply.outcome != 'skipped' }}
+        with:
+          event: breakglass_used
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ needs.validate.outputs.sha }}
+          run-url: ${{ env.RUN_URL }}
+          approver: ${{ steps.approver.outputs.login }}
+          teams-webhook: ${{ secrets.teams-webhook }}
+      - uses: tttao/stagegate-20261109-092159-sandbox/actions/notify@8e8994eb8f69b3485997b9fc0ff98933c3594c06 # STAGEGATE_REF
+        if: ${{ failure() }}
+        with:
+          event: prod_failed
+          repo: ${{ github.repository }}
+          env: prod
+          sha: ${{ needs.validate.outputs.sha }}
+          run-url: ${{ env.RUN_URL }}
+          teams-webhook: ${{ secrets.teams-webhook }}
