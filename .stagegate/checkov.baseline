@@ -1,0 +1,26 @@
+{
+    "failed_checks": [
+        {
+            "file": "/.github/workflows/breakglass.yml",
+            "findings": [
+                {
+                    "resource": "on(breakglass)",
+                    "check_ids": [
+                        "CKV_GHA_7"
+                    ]
+                }
+            ]
+        },
+        {
+            "file": "/.github/workflows/iac-breakglass.yml",
+            "findings": [
+                {
+                    "resource": "on(iac-breakglass)",
+                    "check_ids": [
+                        "CKV_GHA_7"
+                    ]
+                }
+            ]
+        }
+    ]
+}
