@@ -1,0 +1,54 @@
+name: stagegate risk
+description: Classify plan JSON into a risk-tiered change set and report whether anything changes.
+inputs:
+  plan-json:
+    description: Directory of <unit>.json plan files (kept inside the job).
+    required: true
+  sha:
+    description: Commit SHA the plans were made for.
+    required: true
+  env:
+    description: Environment (stage) name.
+    required: true
+  out:
+    description: Path to write the change set JSON to.
+    required: true
+  summary:
+    description: File to append the Markdown summary to, for example the step summary file. Empty for none.
+    required: false
+    default: ""
+  rules:
+    description: Extra risk rules file; adopter rules may only raise a tier. Empty for the built-in rules.
+    required: false
+    default: ""
+outputs:
+  changeset-path:
+    description: Path of the change set JSON.
+    value: ${{ steps.risk.outputs.changeset-path }}
+  has-changes:
+    description: "true when the change set has at least one item."
+    value: ${{ steps.risk.outputs.has-changes }}
+runs:
+  using: composite
+  steps:
+    - id: risk
+      shell: bash
+      env:
+        SG_PLAN_JSON: ${{ inputs.plan-json }}
+        SG_SHA: ${{ inputs.sha }}
+        SG_ENV: ${{ inputs.env }}
+        SG_OUT: ${{ inputs.out }}
+        SG_SUMMARY: ${{ inputs.summary }}
+        SG_RULES: ${{ inputs.rules }}
+      run: |
+        case "$SG_OUT" in *$'\n'* | *$'\r'*) echo "out must be a single line" >&2; exit 1 ;; esac
+        args=(--plan-json "$SG_PLAN_JSON" --sha "$SG_SHA" --env "$SG_ENV" --out "$SG_OUT")
+        [ -z "$SG_SUMMARY" ] || args+=(--summary "$SG_SUMMARY")
+        [ -z "$SG_RULES" ] || args+=(--rules "$SG_RULES")
+        stagegate changeset "${args[@]}"
+        echo "changeset-path=$SG_OUT" >>"$GITHUB_OUTPUT"
+        if [ "$(jq '.items | length' "$SG_OUT")" -gt 0 ]; then
+          echo "has-changes=true" >>"$GITHUB_OUTPUT"
+        else
+          echo "has-changes=false" >>"$GITHUB_OUTPUT"
+        fi

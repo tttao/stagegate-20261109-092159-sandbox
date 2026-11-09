@@ -1,0 +1,58 @@
+name: stagegate ledger
+description: Record the outcome of a deployment (per-unit status and convergence) in the ledger.
+inputs:
+  store:
+    description: Ledger store URL (file://, git-branch:// or azure-blob://).
+    required: true
+  repo:
+    description: Repository as owner/name.
+    required: true
+  env:
+    description: Environment (stage) that was deployed.
+    required: true
+  sha:
+    description: Commit SHA that was deployed.
+    required: true
+  run-id:
+    description: Workflow run id.
+    required: true
+  run-attempt:
+    description: Workflow run attempt.
+    required: true
+  units-json:
+    description: Path of the units JSON mapping each unit to its status and converged flag (the apply action's units-json output).
+    required: true
+  approver:
+    description: Login of the person who approved the deployment. Empty when there was none.
+    required: false
+    default: ""
+  breakglass-incident:
+    description: Incident reference (ABC-123 or INC123) of a break-glass deployment. Empty for a normal one.
+    required: false
+    default: ""
+  mirror-deployments:
+    description: "Set to true to also post a GitHub deployment."
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SG_STORE: ${{ inputs.store }}
+        SG_REPO: ${{ inputs.repo }}
+        SG_ENV: ${{ inputs.env }}
+        SG_SHA: ${{ inputs.sha }}
+        SG_RUN_ID: ${{ inputs.run-id }}
+        SG_RUN_ATTEMPT: ${{ inputs.run-attempt }}
+        SG_UNITS_JSON: ${{ inputs.units-json }}
+        SG_APPROVER: ${{ inputs.approver }}
+        SG_BREAKGLASS_INCIDENT: ${{ inputs.breakglass-incident }}
+        SG_MIRROR: ${{ inputs.mirror-deployments }}
+      run: |
+        args=(--store "$SG_STORE" --repo "$SG_REPO" --env "$SG_ENV" --sha "$SG_SHA"
+          --run-id "$SG_RUN_ID" --run-attempt "$SG_RUN_ATTEMPT" --units-json "$SG_UNITS_JSON")
+        [ -z "$SG_APPROVER" ] || args+=(--approver "$SG_APPROVER")
+        [ -z "$SG_BREAKGLASS_INCIDENT" ] || args+=(--breakglass-incident "$SG_BREAKGLASS_INCIDENT")
+        [ "$SG_MIRROR" != true ] || args+=(--mirror-deployments)
+        stagegate ledger write "${args[@]}"

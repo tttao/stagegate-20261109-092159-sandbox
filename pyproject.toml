@@ -1,0 +1,55 @@
+[project]
+name = "stagegate"
+dynamic = ["version"]
+description = "GitHub Actions-only CI/CD framework for staged, gated infrastructure-as-code promotion."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "httpx>=0.28.1",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+stagegate = "stagegate.cli:entrypoint"
+
+[project.optional-dependencies]
+azure = [
+    "azure-identity>=1.27.0",
+    "azure-storage-blob>=12.31.1",
+]
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.26.0",
+    "pytest>=8",
+    "respx>=0.23.1",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/stagegate/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stagegate"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"rules" = "stagegate/rules"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+markers = [
+    "integration: needs tofu and terragrunt on the machine (run with -m integration)",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

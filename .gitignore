@@ -1,0 +1,3 @@
+.terraform/
+.stagegate-e2e-state/
+__pycache__/

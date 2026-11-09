@@ -1,0 +1,14 @@
+key_provider "azure_vault" "stagegate" {
+  vault_uri      = "@VAULT_URI@"
+  vault_key_name = "@KEY_NAME@"
+  key_length     = 32
+}
+
+method "aes_gcm" "stagegate" {
+  keys = key_provider.azure_vault.stagegate
+}
+
+plan {
+  method   = method.aes_gcm.stagegate
+  enforced = true
+}

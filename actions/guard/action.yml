@@ -1,0 +1,39 @@
+name: stagegate guard
+description: Refuse to deploy a commit to a stage unless it is live in the preceding stage (fails closed).
+inputs:
+  store:
+    description: Ledger store URL (file://, git-branch:// or azure-blob://).
+    required: true
+  repo:
+    description: Repository as owner/name.
+    required: true
+  stage:
+    description: Stage about to be deployed.
+    required: true
+  sha:
+    description: Commit SHA about to be deployed.
+    required: true
+  order:
+    description: Comma-separated stage order. Empty uses the order from .stagegate.yaml.
+    required: false
+    default: ""
+  summary:
+    description: File to append a Markdown rejection block to, for example the step summary file. Empty for none.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SG_STORE: ${{ inputs.store }}
+        SG_REPO: ${{ inputs.repo }}
+        SG_STAGE: ${{ inputs.stage }}
+        SG_SHA: ${{ inputs.sha }}
+        SG_ORDER: ${{ inputs.order }}
+        SG_SUMMARY: ${{ inputs.summary }}
+      run: |
+        args=(--store "$SG_STORE" --repo "$SG_REPO" --stage "$SG_STAGE" --sha "$SG_SHA")
+        [ -z "$SG_ORDER" ] || args+=(--order "$SG_ORDER")
+        [ -z "$SG_SUMMARY" ] || args+=(--summary "$SG_SUMMARY")
+        stagegate guard "${args[@]}"

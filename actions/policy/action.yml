@@ -1,0 +1,34 @@
+name: stagegate policy
+description: Run the Databricks Rego pack on plan JSON with conftest (checksum-verified install). The plan JSON stays in the job.
+inputs:
+  plan-json:
+    description: Directory of <unit>.json plan files (kept inside the job).
+    required: true
+  stage:
+    description: Stage the plans are for; passed to the pack as data so stage-dependent rules fire.
+    required: true
+  conftest-version:
+    description: conftest version to install (must match conftest-sha256).
+    required: false
+    default: "0.71.1"
+  conftest-sha256:
+    description: SHA-256 of conftest_<version>_Linux_x86_64.tar.gz.
+    required: false
+    default: c3f6b2a753bd56e377a1e51a95ae3e057f926f2e9139f7d5b5dfbbaf810f7985
+  tool-mirror:
+    description: >-
+      Optional https base URL (no trailing slash) that replaces https://github.com in the tool
+      download URLs, for GitHub Enterprise Server or offline runners. SHA-256 checks still apply.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SG_PLAN_JSON: ${{ inputs.plan-json }}
+        SG_STAGE: ${{ inputs.stage }}
+        SG_CONFTEST_VERSION: ${{ inputs.conftest-version }}
+        SG_CONFTEST_SHA256: ${{ inputs.conftest-sha256 }}
+        SG_TOOL_MIRROR: ${{ inputs.tool-mirror }}
+      run: "$GITHUB_ACTION_PATH/policy.sh"

@@ -1,0 +1,66 @@
+name: stagegate cockpit site
+description: Build the static cockpit site (cockpit-site/ in the stagegate checkout) and assemble it with a snapshot into an output directory ready for GitHub Pages.
+inputs:
+  snapshot:
+    description: Path of the snapshot.json to publish (schema stagegate.snapshot/v1).
+    required: true
+  out:
+    description: Output directory; created if missing. Receives the built site, snapshot.json and, when history-dir is given, history/index.json plus only the snapshot files it lists.
+    required: true
+  history-dir:
+    description: Optional directory holding index.json (a JSON array of history/YYYY/MM/DD/HHMM.json paths) and those files; only the index and the files it lists are copied to <out>/history/.
+    required: false
+    default: ""
+  node-version:
+    description: Node.js version used to build the site.
+    required: false
+    default: "22"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        package-manager-cache: false # R40 spirit: no dependency cache that PR code could poison
+    - name: Install (lockfile only, no lifecycle scripts) and build
+      shell: bash
+      env:
+        SG_SITE_DIR: ${{ github.action_path }}/../../cockpit-site
+      run: |
+        set -euo pipefail
+        cd "$SG_SITE_DIR"
+        npm ci --ignore-scripts --no-audit --no-fund
+        npm run build
+    - name: Assemble the output directory
+      shell: bash
+      env:
+        SG_SITE_DIR: ${{ github.action_path }}/../../cockpit-site
+        SG_SNAPSHOT: ${{ inputs.snapshot }}
+        SG_OUT: ${{ inputs.out }}
+        SG_HISTORY_DIR: ${{ inputs.history-dir }}
+      run: |
+        set -euo pipefail
+        snapshot=$(realpath -- "$SG_SNAPSHOT")
+        [ -f "$snapshot" ] || { echo "::error::snapshot not found: $SG_SNAPSHOT"; exit 1; }
+        mkdir -p -- "$SG_OUT"
+        cp -R -- "$SG_SITE_DIR/dist/." "$SG_OUT/"
+        cp -- "$snapshot" "$SG_OUT/snapshot.json"
+        if [ -n "$SG_HISTORY_DIR" ]; then
+          [ -d "$SG_HISTORY_DIR" ] || { echo "::error::history-dir not a directory: $SG_HISTORY_DIR"; exit 1; }
+          [ -f "$SG_HISTORY_DIR/index.json" ] || { echo "::error::history-dir has no index.json"; exit 1; }
+          jq -e 'type == "array" and all(type == "string")' "$SG_HISTORY_DIR/index.json" >/dev/null ||
+            { echo "::error::history index.json must be a JSON array of strings"; exit 1; }
+          mkdir -p -- "$SG_OUT/history"
+          cp -- "$SG_HISTORY_DIR/index.json" "$SG_OUT/history/index.json"
+          # only index entries of the exact shape history/YYYY/MM/DD/HHMM.json are published
+          jq -r '.[]' "$SG_HISTORY_DIR/index.json" | while IFS= read -r entry; do
+            [[ "$entry" =~ ^history/[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{4}\.json$ ]] || {
+              echo "::warning::skipping index entry with an unexpected shape"
+              continue
+            }
+            src="$SG_HISTORY_DIR/${entry#history/}"
+            [ -f "$src" ] && [ ! -L "$src" ] || { echo "::warning::index entry not found: $entry"; continue; }
+            mkdir -p -- "$SG_OUT/$(dirname -- "$entry")"
+            cp -- "$src" "$SG_OUT/$entry"
+          done
+        fi

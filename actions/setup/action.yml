@@ -1,0 +1,46 @@
+name: stagegate setup
+description: Install pinned OpenTofu, Terragrunt, uv and the stagegate CLI, verifying SHA-256 checksums.
+inputs:
+  tofu-version:
+    description: OpenTofu version to install (must match tofu-sha256).
+    required: false
+    default: "1.13.9"
+  tofu-sha256:
+    description: SHA-256 of tofu_<version>_linux_amd64.tar.gz.
+    required: false
+    default: b34b327cc1ef07178207b6f2cd1f5276537d3e5b7be316500f6dac50d4c0a857
+  terragrunt-version:
+    description: Terragrunt version to install (must match terragrunt-sha256).
+    required: false
+    default: "1.2.1"
+  terragrunt-sha256:
+    description: SHA-256 of the terragrunt_linux_amd64 binary.
+    required: false
+    default: f2f6238ad2348855a4e876b90fd31f3f5d106bb234794202a00b2bcc139fa753
+  uv-version:
+    description: uv version to install.
+    required: false
+    default: "0.13.7"
+  tool-mirror:
+    description: >-
+      Optional https base URL (no trailing slash) that replaces https://github.com in the tool
+      download URLs, for GitHub Enterprise Server or offline runners. SHA-256 checks still apply.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        version: ${{ inputs.uv-version }}
+        enable-cache: false # R40: never restore or save a uv cache; PR code could poison it
+    - name: Install tools and stagegate
+      shell: bash
+      env:
+        UV_NO_CACHE: "1"
+        SG_TOFU_VERSION: ${{ inputs.tofu-version }}
+        SG_TOFU_SHA256: ${{ inputs.tofu-sha256 }}
+        SG_TERRAGRUNT_VERSION: ${{ inputs.terragrunt-version }}
+        SG_TERRAGRUNT_SHA256: ${{ inputs.terragrunt-sha256 }}
+        SG_TOOL_MIRROR: ${{ inputs.tool-mirror }}
+      run: "$GITHUB_ACTION_PATH/install.sh"

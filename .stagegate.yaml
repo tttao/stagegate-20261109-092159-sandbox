@@ -1,0 +1,11 @@
+# The git-branch ledger lives on the `stagegate-ledger` branch of the sandbox repository itself.
+# The path is the checkout directory of a GitHub-hosted runner: /home/runner/work/<name>/<name>.
+# Change both segments if the sandbox repository is not called stagegate-sandbox.
+stages: [dev, prp, prod]
+engine: opentofu
+units_root: stages
+ledger:
+  url: git-branch:///home/runner/work/stagegate-sandbox/stagegate-sandbox?branch=stagegate-ledger&remote=origin
+gate: always
+notify:
+  teams: true

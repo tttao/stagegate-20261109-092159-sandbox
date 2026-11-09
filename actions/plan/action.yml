@@ -1,0 +1,109 @@
+name: stagegate plan
+description: Plan every unit of an environment in dependency order, bind the plans and detect changes.
+inputs:
+  env:
+    description: Environment (stage) name; units live under <units-root>/<env>.
+    required: true
+  units-root:
+    description: Directory holding one subdirectory of Terragrunt units per environment.
+    required: false
+    default: stages
+  encrypt:
+    description: >-
+      Encrypt plan files (OpenTofu aes_gcm, enforced). With true, key-vault-key-id is required.
+      false is allowed only with binding-mode replan, or same-job for dev and prp. With false and
+      a mode other than same-job the plan files are deleted after planning and no plan-dir is output.
+    required: false
+    default: "true"
+  binding-mode:
+    description: >-
+      How the later apply binds to this plan - same-job (dev and prp only), breakglass (prod only,
+      needs breakglass-incident; plan and apply in one job), encrypted_plan (needs encrypt=true),
+      replan, or drift (only with drift true).
+    required: false
+    default: encrypted_plan
+  breakglass-incident:
+    description: Incident reference (ABC-123 or INC123). Required by, and only meaningful for, binding-mode breakglass.
+    required: false
+    default: ""
+  key-vault-key-id:
+    description: Azure Key Vault key URL (https://<vault>.vault.azure.net/keys/<name>) that protects the plan encryption key.
+    required: false
+    default: ""
+  engine:
+    description: Engine, opentofu or terraform.
+    required: false
+    default: opentofu
+  only-units:
+    description: Comma-separated unit names to plan (names as in the manifest, / written as __). Empty plans every unit. Refused with binding-mode breakglass (break-glass always plans every unit). Dependency order is kept; an unknown name fails.
+    required: false
+    default: ""
+  lock:
+    description: Take the state lock while planning. false passes -lock=false, for a read-only identity that cannot write the lock (pull-request plans).
+    required: false
+    default: "true"
+  lock-timeout:
+    description: How long a plan waits for the state lock (-lock-timeout), for example 30s or 10m. Not used with lock false.
+    required: false
+    default: 10m
+  expect-sha:
+    description: "true makes the action fail unless git HEAD of the working tree equals the SHA in the SG_SHA environment variable. Used by the nightly drift check."
+    required: false
+    default: "false"
+  allow-cascade:
+    description: >-
+      UNSAFE. false (default) makes encrypted_plan and replan refuse when a unit with changes reads
+      the outputs (dependency block, directly or transitively) of another unit that also changes,
+      because its saved plan was made against the upstream's old outputs. true disables the refusal.
+      Ignored by same-job and breakglass, which re-plan each unit right before its apply.
+    required: false
+    default: "false"
+  drift:
+    description: >-
+      Drift mode for the nightly check. Plans each unit with -detailed-exitcode (exit 2 is not a
+      failure), records the exit codes in exit-codes.json and deletes the plan files. Needs
+      binding-mode drift and encrypt false; an apply refuses that mode.
+    required: false
+    default: "false"
+outputs:
+  exit-codes-path:
+    description: Path of exit-codes.json (unit to plan exit code); set only when drift is true.
+    value: ${{ steps.plan.outputs.exit-codes-path }}
+  has-changes:
+    description: "true when the change set has at least one item."
+    value: ${{ steps.plan.outputs.has-changes }}
+  manifest-path:
+    description: Path of the plan binding manifest (manifest.json).
+    value: ${{ steps.plan.outputs.manifest-path }}
+  changeset-path:
+    description: Path of the change set JSON (changeset.json).
+    value: ${{ steps.plan.outputs.changeset-path }}
+  plan-dir:
+    description: Directory of the (encrypted) <unit>.tfplan files; empty when the plans were deleted (unencrypted, not same-job). Plan JSON stays in the job and is never uploaded.
+    value: ${{ steps.plan.outputs.plan-dir }}
+  summary-path:
+    description: Markdown summary of the change set (risk tiers, addresses, principals; never resource values).
+    value: ${{ steps.plan.outputs.summary-path }}
+  json-dir:
+    description: Directory of the <unit>.json plan files. They stay in the job (for in-job policy and scans) and must never be uploaded.
+    value: ${{ steps.plan.outputs.json-dir }}
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      env:
+        SG_ENV: ${{ inputs.env }}
+        SG_UNITS_ROOT: ${{ inputs.units-root }}
+        SG_ENCRYPT: ${{ inputs.encrypt }}
+        SG_KEY_VAULT_KEY_ID: ${{ inputs.key-vault-key-id }}
+        SG_BINDING_MODE: ${{ inputs.binding-mode }}
+        SG_BREAKGLASS_INCIDENT: ${{ inputs.breakglass-incident }}
+        SG_ENGINE: ${{ inputs.engine }}
+        SG_ONLY_UNITS: ${{ inputs.only-units }}
+        SG_LOCK: ${{ inputs.lock }}
+        SG_DRIFT: ${{ inputs.drift }}
+        SG_ALLOW_CASCADE: ${{ inputs.allow-cascade }}
+        SG_LOCK_TIMEOUT: ${{ inputs.lock-timeout }}
+        SG_EXPECT_SHA: ${{ inputs.expect-sha }}
+      run: "$GITHUB_ACTION_PATH/plan.sh"

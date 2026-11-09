@@ -1,0 +1,55 @@
+name: stagegate notify
+description: Post a Teams card with counts and links only (never resource values).
+inputs:
+  event:
+    description: Event name, for example prod_waiting, prod_deployed, prod_failed or drift_found.
+    required: true
+  repo:
+    description: Repository as owner/name.
+    required: true
+  env:
+    description: Environment (stage) the event concerns.
+    required: true
+  sha:
+    description: Commit SHA the event concerns.
+    required: true
+  run-url:
+    description: URL of the workflow run.
+    required: true
+  changeset:
+    description: Change set JSON to take risk counts from. Empty for none.
+    required: false
+    default: ""
+  approver:
+    description: Login of the approver, when the event has one.
+    required: false
+    default: ""
+  detail:
+    description: "Fixed extra status line: replan_needed. Empty for none."
+    required: false
+    default: ""
+  teams-webhook:
+    description: Teams incoming-webhook URL (pass a secret). Empty skips the notification.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SG_EVENT: ${{ inputs.event }}
+        SG_REPO: ${{ inputs.repo }}
+        SG_ENV: ${{ inputs.env }}
+        SG_SHA: ${{ inputs.sha }}
+        SG_RUN_URL: ${{ inputs.run-url }}
+        SG_CHANGESET: ${{ inputs.changeset }}
+        SG_APPROVER: ${{ inputs.approver }}
+        SG_DETAIL: ${{ inputs.detail }}
+        STAGEGATE_TEAMS_WEBHOOK: ${{ inputs.teams-webhook }}
+      run: |
+        args=(--event "$SG_EVENT" --repo "$SG_REPO" --env "$SG_ENV" --sha "$SG_SHA"
+          --run-url "$SG_RUN_URL")
+        [ -z "$SG_CHANGESET" ] || args+=(--changeset "$SG_CHANGESET")
+        [ -z "$SG_APPROVER" ] || args+=(--approver "$SG_APPROVER")
+        [ -z "$SG_DETAIL" ] || args+=(--detail "$SG_DETAIL")
+        stagegate notify "${args[@]}"

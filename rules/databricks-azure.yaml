@@ -1,0 +1,83 @@
+# stagegate risk rules for Databricks on Azure.
+#
+# Schema: a YAML list of rules. Each rule has:
+#   id           unique string. A later file (adopter) may redefine an id only with the
+#                same or a higher tier; a lower tier is rejected (RuleError).
+#   tier         critical | high | medium
+#   types        list of resource types; "*" matches any type
+#   actions      list of plan actions (create, update, delete, replace, read, import,
+#                move, forget, no-op); "any" means every action except no-op and read
+#   attr_true    optional list of attributes that must be true in `after`
+#                (in `before` when the change has no `after`, e.g. delete/forget)
+#   attr_changed optional list of attributes whose value must differ before vs after
+#
+# A change matches when its type matches, ANY of its actions is in the rule's actions,
+# and every attr_true / attr_changed condition holds. The item tier is the highest tier
+# among matched rules. `generic-destroy` is a fallback: it applies only to delete/replace
+# changes that matched no other rule.
+
+- id: dbx-workspace-destroy
+  tier: critical
+  types: [azurerm_databricks_workspace, databricks_metastore, databricks_metastore_assignment]
+  actions: [delete, replace, forget]
+
+- id: dbx-storage-destroy
+  tier: critical
+  types: [databricks_storage_credential, databricks_external_location]
+  actions: [delete, replace, forget]
+
+- id: force-destroy
+  tier: critical
+  types: ["*"]
+  actions: [delete, replace]
+  attr_true: [force_destroy]
+
+- id: dbx-access
+  tier: high
+  types:
+    - databricks_grants
+    - databricks_grant
+    - databricks_permissions
+    - databricks_permission_assignment
+    - databricks_mws_permission_assignment
+    - azurerm_role_assignment
+  actions: [any]
+
+- id: dbx-isolation
+  tier: high
+  types:
+    - databricks_workspace_binding
+    - azurerm_private_endpoint
+    - azurerm_subnet
+    - azurerm_network_security_group
+    - databricks_service_principal_federation_policy
+  actions: [any]
+
+# databricks_catalog belongs to the dbx-isolation family but only when isolation_mode changes.
+- id: dbx-isolation-catalog
+  tier: high
+  types: [databricks_catalog]
+  actions: [any]
+  attr_changed: [isolation_mode]
+
+- id: dbx-compute-policy
+  tier: medium
+  types: [databricks_cluster_policy, databricks_sql_endpoint]
+  actions: [any]
+
+- id: dbx-unsafe-skip-validation
+  tier: medium
+  types: ["*"]
+  actions: [any]
+  attr_true: [skip_validation]
+
+- id: dbx-unsafe-force-update
+  tier: medium
+  types: ["*"]
+  actions: [any]
+  attr_true: [force_update]
+
+- id: generic-destroy
+  tier: medium
+  types: ["*"]
+  actions: [delete, replace]
